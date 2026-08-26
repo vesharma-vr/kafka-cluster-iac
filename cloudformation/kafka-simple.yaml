@@ -1,0 +1,189 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  kafka-simple-cfn: Self-managed Apache Kafka 4.3.1 running on a single EC2 instance
+  in KRaft mode (no Zookeeper, no MSK) inside the account's default VPC. This is a
+  learning-oriented example, not a production or HA design: one instance, one broker,
+  a wide-open security group, and no SSH key pair (SSM Session Manager only).
+
+Parameters:
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+    Description: >
+      The default VPC to deploy into. CloudFormation cannot look up "the default VPC"
+      at template-authoring time the way CDK (Vpc.from_lookup) or Terraform (aws_vpc
+      data source) can, so it must be supplied explicitly as a parameter. See README.md
+      for the AWS CLI command to find your account's default VPC id.
+
+  SubnetId:
+    Type: AWS::EC2::Subnet::Id
+    Description: >
+      A subnet within the chosen default VPC to launch the instance into. Must be a
+      subnet that assigns public IPs (default-VPC subnets do this automatically). See
+      README.md for the AWS CLI command to find your default VPC's subnet ids.
+
+Resources:
+
+  # -------------------- Security group --------------------
+
+  KafkaSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: "kafka-simple-cfn: Kafka client SG. Port 9092 is wide open (0.0.0.0/0) for learning-example simplicity only. No SSH ingress; access via SSM only."
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 9092
+          ToPort: 9092
+          CidrIp: 0.0.0.0/0
+          Description: "Kafka client/data-plane port, open to the world for learning-example simplicity. Scope to your own IP/CIDR for anything beyond a throwaway test."
+      SecurityGroupEgress:
+        - IpProtocol: "-1"
+          CidrIp: 0.0.0.0/0
+          Description: Allow all outbound traffic.
+      Tags:
+        - Key: Name
+          Value: kafka-simple-cfn-sg
+        - Key: Project
+          Value: kafka-simple-no-msk
+        - Key: Iac
+          Value: cfn
+
+  # -------------------- IAM --------------------
+
+  KafkaInstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: kafka-simple-cfn-instance-role
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+      Tags:
+        - Key: Project
+          Value: kafka-simple-no-msk
+        - Key: Iac
+          Value: cfn
+
+  KafkaInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      InstanceProfileName: kafka-simple-cfn-instance-profile
+      Roles:
+        - !Ref KafkaInstanceRole
+
+  # -------------------- Compute --------------------
+
+  KafkaBrokerInstance:
+    Type: AWS::EC2::Instance
+    Properties:
+      InstanceType: t3.small
+      ImageId: "{{resolve:ssm:/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64}}"
+      IamInstanceProfile: !Ref KafkaInstanceProfile
+      NetworkInterfaces:
+        - DeviceIndex: "0"
+          SubnetId: !Ref SubnetId
+          AssociatePublicIpAddress: true
+          GroupSet:
+            - !Ref KafkaSecurityGroup
+      BlockDeviceMappings:
+        - DeviceName: /dev/xvda
+          Ebs:
+            VolumeSize: 20
+            VolumeType: gp3
+      Tags:
+        - Key: Name
+          Value: kafka-simple-broker
+        - Key: Project
+          Value: kafka-simple-no-msk
+        - Key: Iac
+          Value: cfn
+      UserData:
+        Fn::Base64: |
+          #!/bin/bash
+          set -euxo pipefail
+
+          dnf install -y java-17-amazon-corretto-headless wget tar
+
+          if ! id kafka >/dev/null 2>&1; then
+            useradd -r -m -d /home/kafka kafka
+          fi
+
+          mkdir -p /var/lib/kafka/data
+          chown -R kafka:kafka /var/lib/kafka/data
+
+          cd /opt
+          wget -q https://downloads.apache.org/kafka/4.3.1/kafka_2.13-4.3.1.tgz
+          tar -xzf kafka_2.13-4.3.1.tgz
+          rm -f kafka_2.13-4.3.1.tgz
+          if [ ! -d /opt/kafka ]; then
+            mv /opt/kafka_2.13-4.3.1 /opt/kafka
+          fi
+          chown -R kafka:kafka /opt/kafka
+
+          TOKEN=$(curl -sS -X PUT "http://169.254.169.254/latest/api/token" -H "X-aws-ec2-metadata-token-ttl-seconds: 21600")
+          OWN_PRIVATE_IP=$(curl -sS -H "X-aws-ec2-metadata-token: $TOKEN" http://169.254.169.254/latest/meta-data/local-ipv4)
+
+          cat > /opt/kafka/config/server.properties <<EOF
+          process.roles=broker,controller
+          node.id=1
+          controller.quorum.voters=1@${OWN_PRIVATE_IP}:9093
+          listeners=PLAINTEXT://0.0.0.0:9092,CONTROLLER://0.0.0.0:9093
+          inter.broker.listener.name=PLAINTEXT
+          advertised.listeners=PLAINTEXT://${OWN_PRIVATE_IP}:9092
+          controller.listener.names=CONTROLLER
+          listener.security.protocol.map=CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT
+          log.dirs=/var/lib/kafka/data
+          num.partitions=1
+          default.replication.factor=1
+          offsets.topic.replication.factor=1
+          transaction.state.log.replication.factor=1
+          transaction.state.log.min.isr=1
+          EOF
+          chown kafka:kafka /opt/kafka/config/server.properties
+
+          sudo -u kafka /opt/kafka/bin/kafka-storage.sh format --cluster-id zsvUnJ-LSWW-5vb3PEALHQ --config /opt/kafka/config/server.properties --ignore-formatted
+
+          cat > /etc/systemd/system/kafka.service <<'EOF'
+          [Unit]
+          Description=Apache Kafka (KRaft, single node)
+          After=network.target
+
+          [Service]
+          Type=simple
+          User=kafka
+          Environment=JAVA_HOME=/usr/lib/jvm/java-17-amazon-corretto
+          ExecStart=/opt/kafka/bin/kafka-server-start.sh /opt/kafka/config/server.properties
+          Restart=on-failure
+          RestartSec=5
+          LimitNOFILE=65536
+
+          [Install]
+          WantedBy=multi-user.target
+          EOF
+
+          systemctl daemon-reload
+          systemctl enable --now kafka
+
+Outputs:
+  InstanceId:
+    Description: >
+      EC2 instance id of the Kafka broker. Connect via:
+      aws ssm start-session --target <instance-id>
+    Value: !Ref KafkaBrokerInstance
+
+  PublicIp:
+    Description: Public IP address of the Kafka broker instance (for external producer/consumer testing).
+    Value: !GetAtt KafkaBrokerInstance.PublicIp
+
+  PrivateIp:
+    Description: Private IP address of the Kafka broker instance.
+    Value: !GetAtt KafkaBrokerInstance.PrivateIp
+
+  SecurityGroupId:
+    Description: Security group id attached to the Kafka broker instance.
+    Value: !Ref KafkaSecurityGroup

@@ -1,0 +1,20 @@
+# Terraform
+terraform/.terraform/
+terraform/.terraform.lock.hcl
+terraform/terraform.tfstate
+terraform/terraform.tfstate.backup
+terraform/tfplan
+terraform/*.tfvars
+
+# CDK
+cdk/.venv/
+cdk/cdk.out/
+cdk/__pycache__/
+cdk/**/__pycache__/
+
+# Python
+*.pyc
+
+# OS
+.DS_Store
+terraform/
